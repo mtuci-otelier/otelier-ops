@@ -1,0 +1,60 @@
+# локальные переопределения: mailhog вместо реального smtp, swagger включён, порты открыты напрямую.
+
+services:
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+  backend:
+    environment:
+      SERVER__DOCS_ENABLED: "true"
+      CORS__ALLOW_ORIGINS: "http://localhost,http://localhost:5173"
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  mailer:
+    environment:
+      SMTP__HOST: mailhog
+      SMTP__PORT: "1025"
+      SMTP__USE_TLS: "false"
+      SMTP__USER: ""
+      SMTP__PASSWORD: ""
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - mailhog
+
+  # сборка spa и раздача через nginx (демо-данные, vite_use_mocks=true)
+  nginx:
+    image: otelier-web-local
+    build:
+      context: ..
+      dockerfile_inline: |
+        FROM node:20-alpine AS build
+        WORKDIR /app
+        COPY frontend/package.json frontend/package-lock.json ./
+        RUN npm ci --no-audit --no-fund --registry=https://registry.npmmirror.com
+        COPY frontend/tsconfig.json frontend/tsconfig.app.json frontend/tsconfig.node.json ./
+        COPY frontend/vite.config.ts frontend/tailwind.config.js frontend/postcss.config.js frontend/index.html ./
+        COPY frontend/src ./src
+        COPY frontend/public ./public
+        ENV VITE_USE_MOCKS=false
+        RUN npm run build
+        # сборка админ-spa (отдельная минимальная сборка)
+        WORKDIR /admin
+        COPY admin/package.json admin/package-lock.json ./
+        RUN npm ci --no-audit --no-fund --registry=https://registry.npmmirror.com
+        COPY admin/tsconfig.json admin/tsconfig.app.json admin/tsconfig.node.json ./
+        COPY admin/vite.config.ts admin/tailwind.config.js admin/postcss.config.js admin/index.html ./
+        COPY admin/src ./src
+        RUN npm run build
+        FROM nginx:1.27-alpine
+        COPY --from=build /app/dist /usr/share/nginx/html
+        COPY --from=build /admin/dist /usr/share/nginx/admin
+    ports:
+      - "80:80"
+      - "8081:8081"
+    volumes: !override
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro

@@ -1,0 +1,150 @@
+# =============================================================================
+# деплой на vps из github по ssh (ручной запуск с подтверждением).
+# проект разнесён по отдельным репозиториям; этот репозиторий —
+# деплой-оркестратор: содержит infra/ и workflow. на раннере он выкачивает
+# код остальных репозиториев, собирает spa и доставляет всё на сервер.
+# сервер собирает только лёгкие backend/mailer образы и раздаёт готовую статику.
+#
+# секреты/переменные (Settings → Secrets and variables → Actions):
+#   secrets.VPS_HOST     - адрес хоста vps
+#   secrets.VPS_USER     - ssh-пользователь с доступом к docker (напр. deploy)
+#   secrets.VPS_SSH_KEY  - приватный ssh-ключ (pem) этого пользователя
+#   secrets.PROD_ENV     - полное содержимое прод-.env (секрет окружения production)
+#   secrets.GH_PAT       - токен с доступом read к репозиториям компонентов
+#   vars.REPO_BACKEND    - owner/name репозитория бэкенда
+#   vars.REPO_MAILER     - owner/name репозитория mailer
+#   vars.REPO_FRONTEND   - owner/name репозитория фронтенда
+#   vars.REPO_ADMIN      - owner/name репозитория админ-spa
+#   vars.REPO_<X>_REF    - (опц.) ветка/тег компонента; пусто = дефолтная ветка
+#                          (напр. REPO_FRONTEND_REF=feat/frontend)
+#   vars.VITE_TURNSTILE_SITEKEY - (опц.) публичный site key cloudflare turnstile (капча)
+#   vars.DEPLOY_PATH     - корневой каталог проекта на сервере (напр. /opt/otelier)
+#   vars.COMPOSE_FILES   - (опц.) набор -f файлов; по умолчанию base + prod-оверлей
+# =============================================================================
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm a manual production deploy'
+        required: true
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      DEST: ${{ vars.DEPLOY_PATH }}
+      COMPOSE_FILES: ${{ vars.COMPOSE_FILES != '' && vars.COMPOSE_FILES || '-f docker-compose.yml -f docker-compose.prod.yml' }}
+      SSH_TARGET: ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}
+    steps:
+      - name: Guard - require explicit confirmation
+        if: ${{ github.event.inputs.confirm != 'deploy' }}
+        run: |
+          echo "::error::Refusing to deploy: type 'deploy' in the confirm input."
+          exit 1
+
+      - name: Checkout deploy repo (infra)
+        uses: actions/checkout@v4
+
+      - name: Checkout backend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPO_BACKEND }}
+          ref: ${{ vars.REPO_BACKEND_REF }}
+          token: ${{ secrets.GH_PAT }}
+          path: backend
+
+      - name: Checkout mailer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPO_MAILER }}
+          ref: ${{ vars.REPO_MAILER_REF }}
+          token: ${{ secrets.GH_PAT }}
+          path: mailer
+
+      - name: Checkout frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPO_FRONTEND }}
+          ref: ${{ vars.REPO_FRONTEND_REF }}
+          token: ${{ secrets.GH_PAT }}
+          path: frontend
+
+      - name: Checkout admin
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REPO_ADMIN }}
+          ref: ${{ vars.REPO_ADMIN_REF }}
+          token: ${{ secrets.GH_PAT }}
+          path: admin
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build SPAs on runner (frontend + admin)
+        env:
+          VITE_TURNSTILE_SITEKEY: ${{ vars.VITE_TURNSTILE_SITEKEY }}
+        run: |
+          (cd frontend && npm ci && VITE_USE_MOCKS=false npm run build)
+          (cd admin && npm ci && npm run build)
+          rm -rf infra/frontend-dist infra/admin-dist
+          mkdir -p infra/frontend-dist infra/admin-dist
+          cp -r frontend/dist/. infra/frontend-dist/
+          cp -r admin/dist/. infra/admin-dist/
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync to server (infra + backend + mailer + built dist)
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_TARGET" "mkdir -p '$DEST'"
+          rsync -az --delete \
+            --exclude '.git' --exclude 'node_modules' --exclude '.venv' --exclude '*.env' \
+            --exclude '/frontend' --exclude '/admin' \
+            -e "ssh -i ~/.ssh/id_deploy" \
+            ./ "$SSH_TARGET:$DEST/"
+
+      - name: Render .env on server from secret
+        env:
+          PROD_ENV: ${{ secrets.PROD_ENV }}
+        run: |
+          printf '%s' "$PROD_ENV" | ssh -i ~/.ssh/id_deploy "$SSH_TARGET" \
+            "umask 077; cat > '$DEST/infra/.env'"
+
+      # basic-auth для просмотрщика логов. секрет — содержимое .htpasswd целиком
+      # (строки вида user:$apr1$... из `htpasswd -nbB`). всегда создаём файл (пусть пустой),
+      # иначе bind-mount поднимет каталог вместо файла.
+      - name: Render logs .htpasswd on server from secret
+        env:
+          LOGS_HTPASSWD: ${{ secrets.LOGS_HTPASSWD }}
+        run: |
+          printf '%s' "$LOGS_HTPASSWD" | ssh -i ~/.ssh/id_deploy "$SSH_TARGET" \
+            "umask 077; cat > '$DEST/infra/nginx/.htpasswd'"
+
+      - name: Build backend/mailer, start stack and migrate
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_TARGET" \
+            "set -e; cd '$DEST/infra'; \
+             docker compose $COMPOSE_FILES up -d --build; \
+             docker compose $COMPOSE_FILES run --rm migrate"
+
+      - name: Smoke test (liveness)
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_TARGET" "curl -fsS http://localhost/api/health"

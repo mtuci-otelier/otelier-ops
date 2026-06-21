@@ -1,0 +1,15 @@
+*.env
+!*.env.example
+node_modules/
+**/node_modules
+dist/
+**/dist
+.venv
+__pycache__/
+**/__pycache__
+.DS_Store
+*.log
+infra/frontend-dist/*
+infra/admin-dist/*
+!infra/frontend-dist/.gitkeep
+!infra/admin-dist/.gitkeep

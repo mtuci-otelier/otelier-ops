@@ -1,0 +1,22 @@
+# отдельный домен админки. админ-spa и тот же бэкенд (эндпоинты /api/v1/admin/*).
+# spa-сборка админки монтируется отдельно (см. volume admin-dist в compose).
+
+server {
+    listen 80;
+    server_name admin.otelier.example.com;
+
+    # тот же бэкенд; админка ходит в /api/v1/admin/* со своей кукой admin_session.
+    location /api/ {
+        proxy_pass http://backend:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # статика админ-spa (отдельная сборка) с откатом на клиентский роутинг.
+    location / {
+        root /usr/share/nginx/admin;
+        try_files $uri $uri/ /index.html;
+    }
+}

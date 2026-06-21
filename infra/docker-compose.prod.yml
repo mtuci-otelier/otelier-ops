@@ -1,0 +1,25 @@
+# прод-оверлей: nginx раздаёт готовую статику app и админка слушают 80 порт
+# nginx слушает 443 и общается с клаудфлеером
+
+services:
+  nginx:
+    volumes:
+      - ./admin-dist:/usr/share/nginx/admin:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+
+  # просмотрщик docker-логов в браузере ~ 15мб
+  dozzle:
+    image: amir20/dozzle:v8
+    environment:
+      DOZZLE_NO_ANALYTICS: "true"
+      DOZZLE_ADDR: ":8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    expose:
+      - "8080"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
